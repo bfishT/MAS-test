@@ -111,46 +111,35 @@ def calc_cost(model_name, input_tokens, output_tokens):
 
 
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
-def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
+def call_chat(client, inputs, temperature, top_p, model_name_or_path=None, actual_model=None, **model_args):
     """
     Calls the openai API to generate completions for the given inputs.
 
     Args:
-    model_name_or_path (str): The name or path of the model to use.
+    client (openai.OpenAI): The OpenAI client instance.
     inputs (str): The inputs to generate completions for.
-    use_azure (bool): Whether to use the azure API.
     temperature (float): The temperature to use.
     top_p (float): The top_p to use.
+    actual_model (str): The model name to send in the API request.
     **model_args (dict): A dictionary of model arguments.
     """
+    api_model = actual_model or model_name_or_path
     system_messages = inputs.split("\n", 1)[0]
     user_message = inputs.split("\n", 1)[1]
     try:
-        if use_azure:
-            response = openai.chat.completions.create(
-                engine=ENGINES[model_name_or_path] if use_azure else None,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
-        else:
-            response = openai.chat.completions.create(
-                model=model_name_or_path,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
+        response = client.chat.completions.create(
+            model=api_model,
+            messages=[
+                {"role": "system", "content": system_messages},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            **model_args,
+        )
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
-        cost = calc_cost(response.model, input_tokens, output_tokens)
+        cost = calc_cost(model_name_or_path, input_tokens, output_tokens)
         return response, cost
     except openai.BadRequestError as e:
         if e.code == "context_length_exceeded":
@@ -201,16 +190,17 @@ def openai_inference(
         raise ValueError(
             "Must provide an api key. Expected in OPENAI_API_KEY environment variable."
         )
-    openai.api_key = openai_key
     print(f"Using OpenAI key {'*' * max(0, len(openai_key) - 5) + openai_key[-5:]}")
+    api_base = model_args.pop("api_base", None)
     use_azure = model_args.pop("use_azure", False)
-    if use_azure:
-        openai.api_type = "azure"
-        openai.api_base = "https://pnlpopenai3.openai.azure.com/"
-        openai.api_version = "2023-05-15"
     temperature = model_args.pop("temperature", 0.2)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    actual_model = model_args.pop("model", None) or model_name_or_path
+    print(f"Using model: {actual_model}")
+    if api_base:
+        print(f"Using custom API base: {api_base}")
     print(f"Using temperature={temperature}, top_p={top_p}")
+    client = openai.OpenAI(api_key=openai_key, base_url=api_base)
     basic_args = {
         "model_name_or_path": model_name_or_path,
     }
@@ -225,11 +215,13 @@ def openai_inference(
             output_dict.update(basic_args)
             output_dict["text"] = f"{datum['text']}\n\n"
             response, cost = call_chat(
-                output_dict["model_name_or_path"],
+                client,
                 output_dict["text"],
-                use_azure,
                 temperature,
                 top_p,
+                model_name_or_path=model_name_or_path,
+                actual_model=actual_model,
+                **model_args,
             )
             completion = response.choices[0].message.content
             total_cost += cost
@@ -448,6 +440,7 @@ def main(
     output_dir,
     model_args,
     max_cost,
+    instance_ids,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -481,6 +474,13 @@ def main(
     if split not in dataset:
         raise ValueError(f"Invalid split {split} for dataset {dataset_name_or_path}")
     dataset = dataset[split]
+    if instance_ids:
+        id_set = set(instance_ids)
+        dataset = dataset.filter(
+            lambda x: x["instance_id"] in id_set,
+            desc="Filtering by instance_ids",
+            load_from_cache_file=False,
+        )
     lens = np.array(list(map(len, dataset["text"])))
     dataset = dataset.select(np.argsort(lens))
     if len(existing_ids) > 0:
@@ -558,6 +558,12 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Maximum cost to spend on inference.",
+    )
+    parser.add_argument(
+        "--instance_ids",
+        nargs="+",
+        default=None,
+        help="Specific instance ids to run. If None, run all instances in the dataset.",
     )
     args = parser.parse_args()
     main(**vars(args))
